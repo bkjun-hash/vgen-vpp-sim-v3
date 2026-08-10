@@ -8,8 +8,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-SOLAR_EFCR = 0.1278
-ESS_5H_EFCR = 0.81865
+DEFAULT_EXTRA_REVENUE_PER_MW = 14_000_000
+DEFAULT_IMBP_PER_MW = 1_000_000
 DEFAULT_RTU_COST = 1_500_000
 DEFAULT_NEW_METER_COST = 1_500_000
 
@@ -17,273 +17,186 @@ DEFAULT_NEW_METER_COST = 1_500_000
 @dataclass(frozen=True)
 class Inputs:
     capacity_mw: float
-    daily_generation_hours: float
-    degradation_pct: float
-    years: int
-    existing_smp: float
-    rec_price: float
-    da_smp: float
-    rt_smp: float
-    da_plan_ratio: float
-    rt_plan_ratio: float
-    actual_ratio: float
-    available_ratio: float
+    cp_factor: float
     rpcf: float
-    efcr: float
-    cp_price: float
-    map_price: float
-    mwp_price: float
-    imb_tolerance: float
-    imb_factor: float
-    contract: str
+    extra_revenue_per_mw: float
+    imbp_per_mw: float
     owner_share: float
-    sales_fee_rate: float
+    channel_enabled: bool
+    channel_fee_rate: float
+    rtu_required: bool
+    new_meter_required: bool
     rtu_cost: float
-    meter_cost: float
-    annual_service_cost: float
+    new_meter_cost: float
 
 
-def annual_generation_kwh(capacity_mw: float, daily_hours: float, degradation_pct: float, year: int = 1) -> float:
-    return capacity_mw * 1_000 * daily_hours * 365 * ((1 - degradation_pct) ** (year - 1))
-
-
-def settle_market(gen_kwh: float, p: Inputs) -> dict[str, float]:
-    """연간 등가값 기반 영업 시뮬레이션.
-
-    KPX 실제 정산은 거래시간별 계량·입찰·급전 자료로 수행된다. 이 함수는 같은
-    항목의 방향과 배분을 설명하기 위한 연간 등가 근사이며 실제 정산서 대체물이 아니다.
-    """
-    daos = gen_kwh * p.da_plan_ratio
-    rtos = gen_kwh * p.rt_plan_ratio
-    mgo = gen_kwh * p.actual_ratio
-    ra = gen_kwh * p.available_ratio
-
-    market_energy = p.da_smp * daos + p.rt_smp * (mgo - daos)
-    existing_energy = p.existing_smp * mgo
-    mep = market_energy - existing_energy
-
-    capacity_recognition = min(max(p.rpcf, 0), 1) * min(max(p.efcr, 0), 1)
-    cp_quantity = min(ra, rtos, mgo) * capacity_recognition
-    cp = cp_quantity * p.cp_price
-
-    map_quantity = max(daos - max(mgo, rtos), 0)
-    map_payment = map_quantity * p.map_price
-    mwp_quantity = max(rtos - mgo, 0)
-    mwp = mwp_quantity * p.mwp_price
-
-    imbalance_quantity = max(abs(mgo - rtos) - rtos * p.imb_tolerance, 0)
-    imb = -imbalance_quantity * p.rt_smp * p.imb_factor
-    net_vpp = cp + mep + map_payment + mwp + imb
+def calculate(p: Inputs) -> dict[str, float]:
+    gross_extra = p.capacity_mw * p.extra_revenue_per_mw * p.cp_factor * p.rpcf
+    imbp = p.capacity_mw * p.imbp_per_mw
+    distributable = gross_extra - imbp
+    owner_before_infra = distributable * p.owner_share
+    vgen_before_channel = distributable * (1 - p.owner_share)
+    channel_fee = max(vgen_before_channel, 0) * p.channel_fee_rate if p.channel_enabled else 0.0
+    owner_infra = (p.rtu_cost if p.rtu_required else 0) + (p.new_meter_cost if p.new_meter_required else 0)
     return {
-        "CP": cp,
-        "MEP": mep,
-        "MAP": map_payment,
-        "MWP": mwp,
-        "IMB": imb,
-        "VPP 순추가수익": net_vpp,
-        "DAOS": daos,
-        "RTOS": rtos,
-        "MGO": mgo,
-        "RA": ra,
-        "CP 인정물량": cp_quantity,
-        "용량인정계수(RPCF×EFCR)": capacity_recognition,
-        "IMB 대상물량": imbalance_quantity,
+        "총 VPP 추가수익": gross_extra,
+        "IMBP 차감": imbp,
+        "배분대상 순수익": distributable,
+        "발전사업주 배분액": owner_before_infra,
+        "브이젠 배분액": vgen_before_channel,
+        "영업채널 수수료": channel_fee,
+        "발전사업주 RTU·신자취 부담": owner_infra,
+        "발전사업주 1년차 실수익": owner_before_infra - owner_infra,
+        "브이젠 최종수익": vgen_before_channel - channel_fee,
     }
 
 
-def allocate_revenue(settlement: dict[str, float], p: Inputs) -> dict[str, float]:
-    if p.contract == "50:50 순수익 배분":
-        owner_before_fee = settlement["VPP 순추가수익"] * p.owner_share
-        vgen_before_fee = settlement["VPP 순추가수익"] * (1 - p.owner_share)
-    else:
-        owner_before_fee = settlement["MEP"] + settlement["MAP"] + settlement["MWP"]
-        vgen_before_fee = settlement["CP"] + settlement["IMB"]
-
-    # 영업수수료는 IMB 및 계약 배분을 반영한 브이젠 양(+)의 수익에만 적용한다.
-    sales_fee = max(vgen_before_fee, 0) * p.sales_fee_rate
-    vgen_after_fee = vgen_before_fee - sales_fee
-    return {
-        "사업주 VPP 수익": owner_before_fee,
-        "브이젠 수수료 전 수익": vgen_before_fee,
-        "영업수수료": sales_fee,
-        "브이젠 수수료 후 수익": vgen_after_fee,
-    }
+def manwon(value: float) -> str:
+    return f"{value / 10_000:,.0f}만원"
 
 
-def build_cashflow(p: Inputs) -> pd.DataFrame:
-    rows = []
-    cumulative_owner = cumulative_vgen = 0.0
-    investment = p.rtu_cost + p.meter_cost
-    for year in range(1, p.years + 1):
-        gen = annual_generation_kwh(p.capacity_mw, p.daily_generation_hours, p.degradation_pct, year)
-        settlement = settle_market(gen, p)
-        allocation = allocate_revenue(settlement, p)
-        vgen_capex = investment if year == 1 else 0.0
-        owner_net = allocation["사업주 VPP 수익"]
-        vgen_net = allocation["브이젠 수수료 후 수익"] - vgen_capex - p.annual_service_cost
-        cumulative_owner += owner_net
-        cumulative_vgen += vgen_net
-        rows.append({
-            "연차": year,
-            "발전량(kWh)": gen,
-            **{k: settlement[k] for k in ["CP", "MEP", "MAP", "MWP", "IMB", "VPP 순추가수익"]},
-            **allocation,
-            "RTU·신자취 투자비": vgen_capex,
-            "연간 운영비": p.annual_service_cost,
-            "사업주 순추가수익": owner_net,
-            "브이젠 순수익": vgen_net,
-            "사업주 누적수익": cumulative_owner,
-            "브이젠 누적수익": cumulative_vgen,
-        })
-    return pd.DataFrame(rows)
-
-
-def won(value: float) -> str:
-    sign = "-" if value < 0 else ""
-    return f"{sign}{abs(value) / 10_000:,.0f}만원"
-
-
-def pct(value: float) -> str:
-    return f"{value * 100:,.3f}%"
+def metric_card(label: str, value: float, note: str, tone: str = "blue") -> None:
+    st.markdown(
+        f'<div class="metric {tone}"><div class="label">{label}</div>'
+        f'<div class="value">{manwon(value)}</div><div class="note">{note}</div></div>',
+        unsafe_allow_html=True,
+    )
 
 
 st.set_page_config(page_title="V-GEN VPP 수익 계산기", page_icon="⚡", layout="wide")
 st.markdown(
     """
-    <style>
-    .block-container {padding-top: 1.3rem; max-width: 1500px}
-    .hero {padding: 1.6rem 2rem; border-radius: 22px; color: white;
-      background: linear-gradient(125deg,#09284a,#08667b,#14a08f); margin-bottom: 1rem}
-    .hero h1 {margin:0;font-size:2rem}.hero p{margin:.5rem 0 0;opacity:.92}
-    [data-testid="stMetric"] {background:white;border:1px solid #e5e7eb;padding:1rem;border-radius:16px}
-    </style>
-    <div class="hero"><h1>V-GEN VPP 수익 계산기</h1>
-    <p>전력시장 정산 항목, 용량인정계수, 계약 배분과 구축비를 한 화면에서 조정하는 영업 시뮬레이터</p></div>
-    """,
+<style>
+.block-container {max-width: 1320px; padding-top: 1.4rem; padding-bottom: 3rem}
+.hero {padding: 1.7rem 2rem; border-radius: 22px; color:white; margin-bottom:1.1rem;
+ background:linear-gradient(120deg,#082846,#075985,#0f766e)}
+.hero h1{font-size:2rem;margin:0}.hero p{margin:.5rem 0 0;opacity:.93}
+.metric{border:1px solid #dbe4ee;border-top:5px solid #2563eb;border-radius:16px;
+ padding:1.1rem;background:#fff;min-height:140px;box-shadow:0 5px 16px rgba(15,23,42,.05)}
+.metric.green{border-top-color:#16a34a}.metric.orange{border-top-color:#f59e0b}
+.metric.red{border-top-color:#dc2626}.metric.navy{border-top-color:#0f3b61}
+.label{color:#64748b;font-size:.85rem;font-weight:700}.value{font-size:1.85rem;font-weight:850;
+ color:#102a43;margin:.4rem 0}.note{color:#64748b;font-size:.78rem;line-height:1.4}
+.formula{padding:1rem 1.25rem;border-radius:14px;background:#eff6ff;border-left:5px solid #2563eb}
+</style>
+<div class="hero"><h1>V-GEN VPP 수익 계산기</h1>
+<p>용량, CP 계수, RPCF만 바꿔 발전사업주·브이젠·영업채널 수익을 즉시 확인합니다.</p></div>
+""",
     unsafe_allow_html=True,
 )
 
-with st.sidebar:
-    st.header("빠른 설정")
-    region = st.selectbox("시장", ["제주 시범사업", "육지 재생에너지 입찰시장"])
-    asset = st.selectbox("자원 구성", ["태양광", "태양광 + 5시간 ESS"])
-    contract = st.selectbox("계약 정책", ["50:50 순수익 배분", "기본 배분"])
-    default_efcr = SOLAR_EFCR if asset == "태양광" else ESS_5H_EFCR
-    st.caption("모든 기본값은 아래에서 직접 수정할 수 있습니다.")
+st.subheader("1. 핵심 입력")
+i1, i2, i3 = st.columns(3)
+with i1:
+    capacity_mw = st.number_input("발전소 용량(MW)", min_value=0.01, max_value=1000.0, value=1.0, step=0.1)
+with i2:
+    cp_factor_pct = st.number_input("CP 계수(%)", min_value=0.0, max_value=200.0, value=100.0, step=1.0,
+                                    help="기준 CP 수익 대비 적용 비율입니다. 100%가 기준값입니다.")
+with i3:
+    rpcf_pct = st.number_input("RPCF(%)", min_value=0.0, max_value=200.0, value=100.0, step=1.0,
+                               help="성과연동형용량가격계수입니다. 100%가 기준값입니다.")
 
-tab1, tab2, tab3, tab4 = st.tabs(["① 발전소·가격", "② 정산 파라미터", "③ 계약·투자비", "④ 계산 기준"])
-with tab1:
-    a, b, c = st.columns(3)
-    with a:
-        capacity_mw = st.number_input("설비용량(MW)", 0.01, 1000.0, 1.0, 0.1)
-        daily_hours = st.number_input("일평균 발전시간", 0.1, 24.0, 3.6, 0.1)
-        degradation = st.number_input("연간 열화율(%)", 0.0, 10.0, 0.5, 0.1) / 100
-        years = st.slider("분석기간(년)", 1, 30, 20)
-    with b:
-        existing_smp = st.number_input("기존 SMP 상당단가(원/kWh)", 0.0, 1000.0, 120.0, 1.0)
-        rec_price = st.number_input("REC 상당단가(원/kWh)", 0.0, 1000.0, 60.0, 1.0)
-        da_smp = st.number_input("DASMP(원/kWh)", -1000.0, 2000.0, 115.0 if region == "제주 시범사업" else 120.0, 1.0)
-        rt_smp = st.number_input("RTSMP(원/kWh)", -1000.0, 2000.0, 120.0 if region == "제주 시범사업" else 122.0, 1.0)
-    with c:
-        da_ratio = st.number_input("DAOS/기준발전량", 0.0, 2.0, 0.95, 0.01)
-        rt_ratio = st.number_input("RTOS/기준발전량", 0.0, 2.0, 0.93, 0.01)
-        actual_ratio = st.number_input("MGO/기준발전량", 0.0, 2.0, 1.00, 0.01)
-        available_ratio = st.number_input("RA/기준발전량", 0.0, 2.0, 0.95, 0.01)
-
-with tab2:
-    a, b, c = st.columns(3)
-    with a:
-        rpcf = st.number_input("RPCF(%)", 0.0, 150.0, 100.0, 0.1) / 100
-        efcr = st.number_input("EFCR(%)", 0.0, 150.0, default_efcr * 100, 0.001) / 100
-        st.caption(f"기본값: 태양광 {SOLAR_EFCR*100:.2f}% / 5시간 ESS {ESS_5H_EFCR*100:.3f}%")
-    with b:
-        cp_price = st.number_input("CP 단가(원/kWh-인정량)", -1000.0, 2000.0, 22.0 if region == "제주 시범사업" else 11.0, 0.1)
-        map_price = st.number_input("MAP 단가(원/kWh)", -1000.0, 2000.0, 2.5 if region == "제주 시범사업" else 0.8, 0.1)
-        mwp_price = st.number_input("MWP 단가(원/kWh)", -1000.0, 2000.0, 1.0 if region == "제주 시범사업" else 0.5, 0.1)
-    with c:
-        imb_tolerance = st.number_input("IMB 허용오차율(%)", 0.0, 100.0, 8.0, 0.1) / 100
-        imb_factor = st.number_input("IMB 페널티 계수", 0.0, 10.0, 1.0, 0.1)
-        st.info("EFCR과 RPCF는 각각 수정되며 CP 인정계수에는 RPCF × EFCR로 반영됩니다.")
-
-with tab3:
-    a, b, c = st.columns(3)
-    with a:
-        if contract == "50:50 순수익 배분":
-            owner_share = st.slider("사업주 배분율(%)", 0, 100, 50) / 100
-            st.caption("CP+MEP+MAP+MWP+IMB 순액을 배분합니다.")
-        else:
-            owner_share = 0.0
-            st.caption("MEP·MAP·MWP는 사업주, CP·IMB는 브이젠에 반영합니다.")
-        sales_fee = st.number_input("영업수수료율(%)", 0.0, 100.0, 20.0, 1.0) / 100
-        st.caption("계약 배분 및 IMB 반영 후 브이젠 양(+)의 수익에 적용")
-    with b:
-        include_rtu = st.checkbox("RTU 투자비 반영", True)
-        rtu_cost = st.number_input("RTU 투자비(원)", 0, 100_000_000, DEFAULT_RTU_COST, 100_000, disabled=not include_rtu)
-        include_meter = st.checkbox("신자취 투자비 반영", True)
-        meter_cost = st.number_input("신자취 투자비(원)", 0, 100_000_000, DEFAULT_NEW_METER_COST, 100_000, disabled=not include_meter)
-    with c:
-        annual_service = st.number_input("연간 통신·운영비(원)", 0, 100_000_000, 0, 100_000)
-        st.metric("브이젠 초기투자비", won((rtu_cost if include_rtu else 0) + (meter_cost if include_meter else 0)))
-
-with tab4:
-    st.markdown("""
-    - 실제 KPX 정산은 거래시간별 입찰량·발전계획량·계량값·급전지시 및 적용 규칙으로 계산됩니다.
-    - 이 계산기는 영업 검토를 위한 연간 등가 근사 모델이며, 입력값을 공개해 결과의 근거를 추적할 수 있게 설계했습니다.
-    - CP 인정량은 `min(RA, RTOS, MGO) × RPCF × EFCR`로 근사합니다.
-    - 50:50 계약은 `(CP + MEP + MAP + MWP + IMB) × 배분율`을 사용합니다.
-    - 영업수수료는 IMB와 계약배분 이후 브이젠의 양(+)의 수익에만 적용합니다.
-    """)
+with st.expander("계약·비용 설정", expanded=True):
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        owner_share_pct = st.slider("발전사업주 배분율(%)", 0, 100, 50)
+        channel_enabled = st.toggle("영업채널 계약 적용", value=False)
+        channel_fee_pct = st.number_input("영업채널 수수료율(브이젠 몫 기준, %)", 0.0, 100.0, 20.0, 1.0,
+                                          disabled=not channel_enabled)
+    with c2:
+        rtu_required = st.checkbox("RTU 설치 필요", value=True)
+        rtu_cost = st.number_input("RTU 비용(발전사업주 부담, 원)", 0, 100_000_000, DEFAULT_RTU_COST, 100_000,
+                                   disabled=not rtu_required)
+        new_meter_required = st.checkbox("신자취 설치 필요", value=True)
+        new_meter_cost = st.number_input("신자취 비용(발전사업주 부담, 원)", 0, 100_000_000, DEFAULT_NEW_METER_COST, 100_000,
+                                         disabled=not new_meter_required)
+    with c3:
+        extra_revenue_per_mw = st.number_input("기준 총 추가수익(원/MW·년)", 0, 100_000_000, DEFAULT_EXTRA_REVENUE_PER_MW, 100_000)
+        imbp_per_mw = st.number_input("IMBP 차감액(원/MW·년)", 0, 100_000_000, DEFAULT_IMBP_PER_MW, 100_000)
+        st.caption("기본값: 총 추가수익 1,400만원/MW·년, IMBP 100만원/MW·년")
 
 p = Inputs(
-    capacity_mw, daily_hours, degradation, years, existing_smp, rec_price,
-    da_smp, rt_smp, da_ratio, rt_ratio, actual_ratio, available_ratio,
-    rpcf, efcr, cp_price, map_price, mwp_price, imb_tolerance, imb_factor,
-    contract, owner_share, sales_fee, rtu_cost if include_rtu else 0,
-    meter_cost if include_meter else 0, annual_service,
+    capacity_mw=capacity_mw,
+    cp_factor=cp_factor_pct / 100,
+    rpcf=rpcf_pct / 100,
+    extra_revenue_per_mw=float(extra_revenue_per_mw),
+    imbp_per_mw=float(imbp_per_mw),
+    owner_share=owner_share_pct / 100,
+    channel_enabled=channel_enabled,
+    channel_fee_rate=channel_fee_pct / 100,
+    rtu_required=rtu_required,
+    new_meter_required=new_meter_required,
+    rtu_cost=float(rtu_cost if rtu_required else 0),
+    new_meter_cost=float(new_meter_cost if new_meter_required else 0),
 )
-gen = annual_generation_kwh(capacity_mw, daily_hours, degradation)
-settlement = settle_market(gen, p)
-allocation = allocate_revenue(settlement, p)
-cashflow = build_cashflow(p)
+r = calculate(p)
 
-st.subheader("1년차 핵심 결과")
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("VPP 순추가수익", won(settlement["VPP 순추가수익"]))
-c2.metric("사업주 추가수익", won(allocation["사업주 VPP 수익"]))
-c3.metric("브이젠 수수료 전", won(allocation["브이젠 수수료 전 수익"]))
-c4.metric("영업수수료", won(allocation["영업수수료"]))
-c5.metric("브이젠 1년차 순수익", won(cashflow.iloc[0]["브이젠 순수익"]))
-
-st.caption(
-    f"CP 인정계수 {pct(settlement['용량인정계수(RPCF×EFCR)'])} · "
-    f"CP 인정물량 {settlement['CP 인정물량']:,.0f}kWh · 초기투자비 {won(p.rtu_cost+p.meter_cost)}"
+st.markdown(
+    f'<div class="formula"><b>기본 계산:</b> {capacity_mw:,.2f}MW × '
+    f'{manwon(extra_revenue_per_mw)}/MW × CP {cp_factor_pct:,.1f}% × RPCF {rpcf_pct:,.1f}% '
+    f'= <b>{manwon(r["총 VPP 추가수익"])}</b> → IMBP {manwon(r["IMBP 차감"])} 차감 → '
+    f'<b>배분대상 {manwon(r["배분대상 순수익"])}</b></div>',
+    unsafe_allow_html=True,
 )
 
-left, right = st.columns([1.2, 1])
-with left:
-    item_df = pd.DataFrame({"정산항목": ["CP", "MEP", "MAP", "MWP", "IMB"], "금액(만원)": [settlement[k] / 10_000 for k in ["CP", "MEP", "MAP", "MWP", "IMB"]]})
-    fig = go.Figure(go.Bar(x=item_df["정산항목"], y=item_df["금액(만원)"], marker_color=["#0f766e", "#2563eb", "#14b8a6", "#38bdf8", "#ef4444"]))
-    fig.update_layout(title="정산항목별 1년차 효과", yaxis_title="만원", height=390, margin=dict(l=20, r=20, t=55, b=30))
-    st.plotly_chart(fig, width="stretch")
-with right:
-    st.dataframe(pd.DataFrame({"항목": settlement.keys(), "값": settlement.values()}), width="stretch", hide_index=True, height=390)
+st.subheader("2. 기본 수익 배분")
+a, b, c, d = st.columns(4)
+with a:
+    metric_card("총 VPP 추가수익", r["총 VPP 추가수익"], "CP 계수와 RPCF 반영 전력시장 추가수익", "navy")
+with b:
+    metric_card("IMBP 차감", -r["IMBP 차감"], "50:50 배분 전에 우선 차감", "red")
+with c:
+    metric_card("발전사업주 배분액", r["발전사업주 배분액"], f"순수익의 {owner_share_pct}%", "green")
+with d:
+    metric_card("브이젠 배분액", r["브이젠 배분액"], f"순수익의 {100-owner_share_pct}%", "blue")
 
-st.subheader("연차별 누적 수익")
-fig2 = go.Figure()
-fig2.add_trace(go.Scatter(x=cashflow["연차"], y=cashflow["사업주 누적수익"] / 10_000, name="사업주 누적"))
-fig2.add_trace(go.Scatter(x=cashflow["연차"], y=cashflow["브이젠 누적수익"] / 10_000, name="브이젠 누적"))
-fig2.update_layout(yaxis_title="만원", xaxis_title="연차", height=390, legend=dict(orientation="h"))
-st.plotly_chart(fig2, width="stretch")
+st.subheader("3. 영업채널 및 설치비 반영")
+e, f, g, h = st.columns(4)
+with e:
+    metric_card("영업채널 수수료", r["영업채널 수수료"],
+                f"브이젠 배분액의 {channel_fee_pct:.0f}%" if channel_enabled else "영업채널 미적용", "orange")
+with f:
+    metric_card("브이젠 최종수익", r["브이젠 최종수익"], "브이젠 배분액 - 채널수수료", "blue")
+with g:
+    metric_card("발전사업주 설치비", -r["발전사업주 RTU·신자취 부담"], "RTU·신자취는 발전사업주 부담", "red")
+with h:
+    metric_card("발전사업주 1년차 실수익", r["발전사업주 1년차 실수익"], "배분액 - RTU·신자취", "green")
 
-with st.expander("연차별 상세 현금흐름", expanded=False):
-    st.dataframe(cashflow, width="stretch", hide_index=True)
+chart_df = pd.DataFrame({
+    "구분": ["총 추가수익", "IMBP", "발전사업주 배분", "브이젠 배분", "채널수수료", "발전사업주 설치비"],
+    "금액(만원)": [r["총 VPP 추가수익"], -r["IMBP 차감"], r["발전사업주 배분액"],
+                  r["브이젠 배분액"], -r["영업채널 수수료"], -r["발전사업주 RTU·신자취 부담"]],
+})
+chart_df["금액(만원)"] /= 10_000
+fig = go.Figure(go.Bar(x=chart_df["구분"], y=chart_df["금액(만원)"],
+                       marker_color=["#0f3b61", "#dc2626", "#16a34a", "#2563eb", "#f59e0b", "#ef4444"],
+                       text=[f"{v:,.0f}" for v in chart_df["금액(만원)"]], textposition="outside"))
+fig.update_layout(height=410, yaxis_title="만원/년", margin=dict(l=20, r=20, t=30, b=40))
+st.plotly_chart(fig, width="stretch")
 
-params_df = pd.DataFrame([asdict(p)])
+st.subheader("4. 용량별 빠른 비교")
+capacities = sorted(set([0.5, 1.0, 3.0, 5.0, 10.0, round(capacity_mw, 2)]))
+rows = []
+for cap in capacities:
+    cap_result = calculate(Inputs(**(asdict(p) | {"capacity_mw": cap})))
+    rows.append({
+        "용량(MW)": cap,
+        "총 추가수익(만원)": cap_result["총 VPP 추가수익"] / 10_000,
+        "IMBP(만원)": cap_result["IMBP 차감"] / 10_000,
+        "발전사업주 배분액(만원)": cap_result["발전사업주 배분액"] / 10_000,
+        "브이젠 배분액(만원)": cap_result["브이젠 배분액"] / 10_000,
+        "채널수수료(만원)": cap_result["영업채널 수수료"] / 10_000,
+        "브이젠 최종수익(만원)": cap_result["브이젠 최종수익"] / 10_000,
+    })
+quick_df = pd.DataFrame(rows)
+st.dataframe(quick_df.round(1), width="stretch", hide_index=True)
+
 download = BytesIO()
 with pd.ExcelWriter(download, engine="openpyxl") as writer:
-    params_df.to_excel(writer, sheet_name="입력값", index=False)
-    cashflow.to_excel(writer, sheet_name="연차별현금흐름", index=False)
-    pd.DataFrame([settlement | allocation]).to_excel(writer, sheet_name="1년차결과", index=False)
-st.download_button("입력값·결과 Excel 다운로드", download.getvalue(), "vgen_vpp_simulation.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    pd.DataFrame([asdict(p)]).to_excel(writer, sheet_name="입력값", index=False)
+    pd.DataFrame([r]).to_excel(writer, sheet_name="계산결과", index=False)
+    quick_df.to_excel(writer, sheet_name="용량별비교", index=False)
+st.download_button("계산 결과 Excel 다운로드", download.getvalue(), "vgen_vpp_profit.xlsx",
+                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-st.warning("본 결과는 영업 검토용 근사치입니다. 실제 정산은 최신 전력시장운영규칙과 KPX 정산자료를 기준으로 확인해야 합니다.")
+st.info("기본 1MW·CP 100%·RPCF 100% 기준: 총 1,400만원 → IMBP 100만원 차감 → 50:50 각 650만원. 영업채널 적용 시 브이젠 몫의 20%를 채널에 지급합니다.")
