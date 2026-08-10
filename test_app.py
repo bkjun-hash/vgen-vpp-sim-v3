@@ -1,40 +1,40 @@
 import unittest
 
-from app import Inputs, allocate_revenue, settle_market
+from app import Inputs, calculate
 
 
-def params(**changes):
-    base = dict(
-        capacity_mw=1, daily_generation_hours=3.6, degradation_pct=0.005, years=20,
-        existing_smp=120, rec_price=60, da_smp=120, rt_smp=120,
-        da_plan_ratio=1, rt_plan_ratio=1, actual_ratio=1, available_ratio=1,
-        rpcf=1, efcr=0.1278, cp_price=10, map_price=0, mwp_price=0,
-        imb_tolerance=0.08, imb_factor=1, contract="50:50 순수익 배분",
-        owner_share=0.5, sales_fee_rate=0.2, rtu_cost=1_500_000,
-        meter_cost=1_500_000, annual_service_cost=0,
+def base(**changes):
+    values = dict(
+        capacity_mw=1, cp_factor=1, rpcf=1, extra_revenue_per_mw=14_000_000,
+        imbp_per_mw=1_000_000, owner_share=0.5, channel_enabled=False,
+        channel_fee_rate=0.2, rtu_required=True, new_meter_required=True,
+        rtu_cost=1_500_000, new_meter_cost=1_500_000,
     )
-    base.update(changes)
-    return Inputs(**base)
+    values.update(changes)
+    return Inputs(**values)
 
 
 class CalculatorTests(unittest.TestCase):
-    def test_efcr_applies_to_cp_quantity(self):
-        result = settle_market(1_000, params())
-        self.assertAlmostEqual(result["CP 인정물량"], 127.8)
-        self.assertAlmostEqual(result["CP"], 1_278)
+    def test_default_contract_matches_business_case(self):
+        r = calculate(base())
+        self.assertEqual(r["총 VPP 추가수익"], 14_000_000)
+        self.assertEqual(r["배분대상 순수익"], 13_000_000)
+        self.assertEqual(r["발전사업주 배분액"], 6_500_000)
+        self.assertEqual(r["브이젠 배분액"], 6_500_000)
 
-    def test_fifty_fifty_splits_after_imb_and_fee_uses_vgen_net(self):
-        settlement = {"CP": 100, "MEP": 40, "MAP": 10, "MWP": 0, "IMB": -50, "VPP 순추가수익": 100}
-        result = allocate_revenue(settlement, params())
-        self.assertEqual(result["사업주 VPP 수익"], 50)
-        self.assertEqual(result["브이젠 수수료 전 수익"], 50)
-        self.assertEqual(result["영업수수료"], 10)
-        self.assertEqual(result["브이젠 수수료 후 수익"], 40)
+    def test_channel_fee_is_twenty_percent_of_vgen_share(self):
+        r = calculate(base(channel_enabled=True))
+        self.assertEqual(r["영업채널 수수료"], 1_300_000)
+        self.assertEqual(r["브이젠 최종수익"], 5_200_000)
 
-    def test_standard_fee_is_not_based_on_cp_gross(self):
-        settlement = {"CP": 100, "MEP": 40, "MAP": 10, "MWP": 0, "IMB": -50, "VPP 순추가수익": 100}
-        result = allocate_revenue(settlement, params(contract="기본 배분"))
-        self.assertEqual(result["영업수수료"], 10)
+    def test_owner_pays_rtu_and_meter(self):
+        r = calculate(base())
+        self.assertEqual(r["발전사업주 RTU·신자취 부담"], 3_000_000)
+        self.assertEqual(r["발전사업주 1년차 실수익"], 3_500_000)
+
+    def test_cp_and_rpcf_scale_gross_revenue(self):
+        r = calculate(base(cp_factor=0.8, rpcf=0.75))
+        self.assertEqual(r["총 VPP 추가수익"], 8_400_000)
 
 
 if __name__ == "__main__":
